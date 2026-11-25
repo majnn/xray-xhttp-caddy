@@ -610,14 +610,15 @@ HTML
 
     cat > "$CADDY_CONF" <<CADDY
 ${domain} {
-    encode gzip zstd
-
     @xhttp path ${secret_path} ${secret_path}/*
-    reverse_proxy @xhttp h2c://127.0.0.1:${port} {
-        flush_interval -1
+    handle @xhttp {
+        reverse_proxy h2c://127.0.0.1:${port} {
+            flush_interval -1
+        }
     }
 
     handle {
+        encode gzip zstd
         root * ${web_root}
         file_server
     }
