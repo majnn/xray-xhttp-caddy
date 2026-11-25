@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Xray (VLESS + XHTTP) + Caddy 交互式管理菜单
 # 适用于 Debian / Ubuntu（含 Oracle Cloud ARM64）
+# 采用独立多实例配置 (/usr/local/etc/xray/xhttp.json + xray@xhttp.service)，不干扰原有 Xray/sing-box 实例
 
-XRAY_CONF="/usr/local/etc/xray/config.json"
+XRAY_CONF="/usr/local/etc/xray/xhttp.json"
+XRAY_SVC="xray@xhttp"
 CADDY_CONF="/etc/caddy/Caddyfile"
 BBR_CONF="/etc/sysctl.d/99-bbr.conf"
 
@@ -110,7 +112,7 @@ get_svc_badge() {
     local svc="$1"
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
         echo -e "${GREEN}运行中${NC}"
-    elif systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+    elif systemctl cat "$svc" >/dev/null 2>&1; then
         echo -e "${RED}已停止${NC}"
     else
         echo -e "${YELLOW}未安装${NC}"
@@ -133,10 +135,82 @@ get_caddy_ver() {
     fi
 }
 
+xray_supports_xhttp() {
+    command -v xray >/dev/null 2>&1 || return 1
+    local tmp_cfg rc=1
+    tmp_cfg=$(mktemp /tmp/xray-xhttp-check.XXXXXX.json)
+    cat > "$tmp_cfg" <<'EOF'
+{
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 19999,
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"id": "00000000-0000-0000-0000-000000000000"}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "none",
+        "xhttpSettings": {
+          "path": "/test",
+          "mode": "auto"
+        }
+      }
+    }
+  ],
+  "outbounds": [{"protocol": "freedom"}]
+}
+EOF
+    if xray run -test -c "$tmp_cfg" >/dev/null 2>&1; then
+        rc=0
+    fi
+    rm -f "$tmp_cfg"
+    return "$rc"
+}
+
+ensure_xray_template_unit() {
+    if [[ -f /etc/systemd/system/xray@.service || -f /lib/systemd/system/xray@.service || -f /usr/lib/systemd/system/xray@.service ]]; then
+        return 0
+    fi
+    local xray_bin run_user run_group
+    xray_bin=$(command -v xray)
+    if id xray >/dev/null 2>&1; then
+        run_user="xray"
+        run_group="xray"
+    else
+        run_user="nobody"
+        run_group="nogroup"
+    fi
+    cat > /etc/systemd/system/xray@.service <<EOF
+[Unit]
+Description=Xray Service (%i)
+Documentation=https://xtls.github.io/
+After=network.target nss-lookup.target
+
+[Service]
+User=${run_user}
+Group=${run_group}
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=yes
+ExecStart=${xray_bin} run -config /usr/local/etc/xray/%i.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
 print_status_box() {
     load_state
     local xray_st caddy_st xray_v caddy_v bbr_st
-    xray_st=$(get_svc_badge xray)
+    xray_st=$(get_svc_badge "$XRAY_SVC")
     caddy_st=$(get_svc_badge caddy)
     xray_v=$(get_xray_ver)
     caddy_v=$(get_caddy_ver)
@@ -146,9 +220,10 @@ print_status_box() {
     echo -e "${BOLD}         Xray (VLESS + XHTTP) + Caddy 管理菜单${NC}"
     echo -e "${CYAN}============================================================${NC}"
     echo -e "  域名      : ${BOLD}${CUR_DOMAIN}${NC}"
-    echo -e "  Xray      : ${xray_st} (版本: ${xray_v}) | 监听: ${CUR_LISTEN}:${CUR_PORT}"
+    echo -e "  Xray      : ${xray_st} (实例: ${XRAY_SVC}, 版本: ${xray_v}) | 监听: ${CUR_LISTEN}:${CUR_PORT}"
     echo -e "  Caddy     : ${caddy_st} (版本: ${caddy_v}) | 端口: 80 / 443"
     echo -e "  XHTTP路径 : ${BOLD}${CUR_PATH}${NC} (mode: ${CUR_MODE})"
+    echo -e "  配置文件  : ${XRAY_CONF}"
     echo -e "  用户数量  : ${CUR_USER_COUNT} 个"
     echo -e "  BBR 状态  : ${bbr_st}"
     echo -e "${CYAN}------------------------------------------------------------${NC}"
@@ -254,7 +329,7 @@ with open(conf_path, 'w', encoding='utf-8') as f:
 PY
     then
         if xray run -test -c "$XRAY_CONF" >/dev/null 2>&1; then
-            systemctl restart xray
+            systemctl restart "$XRAY_SVC"
             info "用户添加成功！UUID: $new_uuid"
             echo ""
             print_links
@@ -311,7 +386,7 @@ print(removed.get("id", ""))
 PY
     ); then
         if xray run -test -c "$XRAY_CONF" >/dev/null 2>&1; then
-            systemctl restart xray
+            systemctl restart "$XRAY_SVC"
             info "已删除用户: $removed_uid"
         else
             err "Xray 配置校验失败，已自动回滚。"
@@ -370,7 +445,7 @@ with open(cconf, 'w', encoding='utf-8') as f:
 PY
     then
         if xray run -test -c "$XRAY_CONF" >/dev/null 2>&1 && caddy validate --config "$CADDY_CONF" >/dev/null 2>&1; then
-            systemctl restart xray
+            systemctl restart "$XRAY_SVC"
             systemctl reload caddy
             info "路径已成功更改为: $new_path"
             echo ""
@@ -388,37 +463,38 @@ PY
 }
 
 service_menu() {
+    load_state
     echo ""
-    echo "1) 重启 Xray 和 Caddy"
-    echo "2) 仅重启 Xray"
+    echo "1) 重启 Xray (${XRAY_SVC}) 和 Caddy"
+    echo "2) 仅重启 Xray (${XRAY_SVC})"
     echo "3) 仅平滑重载 Caddy"
-    echo "4) 停止 Xray 和 Caddy"
+    echo "4) 停止 Xray (${XRAY_SVC}) 和 Caddy"
     echo "5) 查看服务状态与端口监听"
     echo "0) 返回主菜单"
     local sub
     read -rp "请选择 [0-5]: " sub
     case "$sub" in
         1)
-            systemctl restart xray caddy
-            info "已重启 Xray 和 Caddy。"
-            systemctl is-active xray caddy
+            systemctl restart "$XRAY_SVC" caddy
+            info "已重启 ${XRAY_SVC} 和 Caddy。"
+            systemctl is-active "$XRAY_SVC" caddy
             ;;
         2)
-            systemctl restart xray
-            info "已重启 Xray: $(systemctl is-active xray)"
+            systemctl restart "$XRAY_SVC"
+            info "已重启 ${XRAY_SVC}: $(systemctl is-active "$XRAY_SVC")"
             ;;
         3)
             caddy validate --config "$CADDY_CONF" && systemctl reload caddy
             info "已重载 Caddy: $(systemctl is-active caddy)"
             ;;
         4)
-            systemctl stop xray caddy
-            warn "已停止 Xray 和 Caddy。"
+            systemctl stop "$XRAY_SVC" caddy
+            warn "已停止 ${XRAY_SVC} 和 Caddy。"
             ;;
         5)
-            systemctl --no-pager -l status xray caddy || true
+            systemctl --no-pager -l status "$XRAY_SVC" caddy || true
             echo "--- 端口监听 ---"
-            ss -tulpn | grep -E ':80 |:443 |:10000 ' || ss -tulpn | grep -E 'xray|caddy' || true
+            ss -tulpn | grep -E ":80 |:443 |:${CUR_PORT:-10000} " || ss -tulpn | grep -E 'xray|caddy' || true
             ;;
         0|"") return 0 ;;
         *) warn "无效选项。" ;;
@@ -427,16 +503,16 @@ service_menu() {
 
 logs_menu() {
     echo ""
-    echo "1) 查看 Xray 最近 50 行日志"
-    echo "2) 实时跟踪 Xray 日志 (Ctrl+C 退出)"
+    echo "1) 查看 Xray (${XRAY_SVC}) 最近 50 行日志"
+    echo "2) 实时跟踪 Xray (${XRAY_SVC}) 日志 (Ctrl+C 退出)"
     echo "3) 查看 Caddy 最近 50 行日志"
     echo "4) 实时跟踪 Caddy 日志 (Ctrl+C 退出)"
     echo "0) 返回主菜单"
     local sub
     read -rp "请选择 [0-4]: " sub
     case "$sub" in
-        1) journalctl -u xray -n 50 --no-pager ;;
-        2) trap 'echo ""' INT; journalctl -u xray -f; trap - INT ;;
+        1) journalctl -u "$XRAY_SVC" -n 50 --no-pager ;;
+        2) trap 'echo ""' INT; journalctl -u "$XRAY_SVC" -f; trap - INT ;;
         3) journalctl -u caddy -n 50 --no-pager ;;
         4) trap 'echo ""' INT; journalctl -u caddy -f; trap - INT ;;
         0|"") return 0 ;;
@@ -461,12 +537,13 @@ EOF
 }
 
 update_components() {
-    info "正在更新 Xray-core（保留现有 config.json）..."
+    info "正在更新 Xray-core（保留现有 config.json 与 ${XRAY_CONF}）..."
     bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    ensure_xray_template_unit
     info "正在更新 Caddy..."
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy
-    systemctl restart xray caddy
+    systemctl restart "$XRAY_SVC" caddy
     info "更新完成！Xray: $(get_xray_ver) | Caddy: $(get_caddy_ver)"
 }
 
@@ -492,32 +569,60 @@ open_firewall_ports() {
     fi
 }
 
+is_port_in_use() {
+    local p="$1"
+    ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"
+}
+
 fresh_deploy() {
     require_python3
-    local domain port web_root confirm
+    local domain port web_root confirm ts
     read -rp "请输入已解析到本机的域名 (例如 example.com): " domain
     domain=$(echo "$domain" | tr -d '\r\n' | xargs)
     if [[ -z "$domain" ]]; then
         err "域名不能为空。"
         return 1
     fi
-    read -rp "Xray 本地监听端口 [默认 10000]: " port
-    port=${port:-10000}
+
+    while true; do
+        read -rp "Xray 本地监听端口 [默认 10000]: " port
+        port=${port:-10000}
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1024 || port > 65535 )); then
+            err "请输入 1024-65535 之间的端口号。"
+            continue
+        fi
+        if is_port_in_use "$port"; then
+            warn "端口 ${port} 已被本机其他进程占用，请换一个未占用的本地端口（例如 10086）。"
+            continue
+        fi
+        break
+    done
+
     read -rp "伪装静态网站目录 [默认 /var/www/site]: " web_root
     web_root=${web_root:-/var/www/site}
 
     if [[ -f "$XRAY_CONF" || -f "$CADDY_CONF" ]]; then
-        read -rp "检测到已有配置，继续将覆盖现有 Xray 和 Caddy 配置，确认? [y/N]: " confirm
+        read -rp "检测到已有 ${XRAY_CONF} 或 ${CADDY_CONF}，继续将自动备份后覆盖（不会触碰 config.json），确认? [y/N]: " confirm
         [[ ! "$confirm" =~ ^[Yy]$ ]] && info "已取消。" && return 0
+        ts=$(date +%Y%m%d%H%M%S)
+        [[ -f "$XRAY_CONF" ]] && cp -a "$XRAY_CONF" "${XRAY_CONF}.bak.${ts}"
+        [[ -f "$CADDY_CONF" ]] && cp -a "$CADDY_CONF" "${CADDY_CONF}.bak.${ts}"
     fi
 
     info "1/5 检查并放行防火墙 80/443 端口..."
     open_firewall_ports
 
-    info "2/5 安装 Xray-core..."
+    info "2/5 检查并准备 Xray-core（独立实例 ${XRAY_SVC}）..."
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl openssl gnupg debian-keyring debian-archive-keyring apt-transport-https
-    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+    if xray_supports_xhttp; then
+        info "检测到本机已安装支持 XHTTP 的 Xray ($(get_xray_ver))，将直接复用（不重装、不改动原有 config.json）。"
+    else
+        info "未检测到支持 XHTTP 的 Xray，正在安装最新 Xray-core..."
+        bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    fi
+    ensure_xray_template_unit
 
     local uuid secret_path
     uuid=$(xray uuid)
@@ -561,8 +666,8 @@ fresh_deploy() {
 EOF
     chmod 644 "$XRAY_CONF"
     xray run -test -c "$XRAY_CONF"
-    systemctl enable --now xray
-    systemctl restart xray
+    systemctl enable --now "$XRAY_SVC"
+    systemctl restart "$XRAY_SVC"
 
     info "3/5 安装并配置 Caddy 与伪装静态站..."
     if ! command -v caddy >/dev/null 2>&1; then
@@ -649,7 +754,7 @@ show_menu() {
         echo "  6. 查看服务日志 (Xray / Caddy)"
         echo "  7. 开启系统原生 BBR"
         echo "  8. 更新 Xray-core 与 Caddy 到最新版"
-        echo "  9. 全新一键部署 (适用于新 VPS 复用本脚本)"
+        echo "  9. 全新一键部署 (独立实例 xray@xhttp，不影响旧配置)"
         echo "  0. 退出"
         echo -e "${CYAN}============================================================${NC}"
         read -rp "请输入选项 [0-9]: " choice
