@@ -576,9 +576,13 @@ is_port_in_use() {
 
 fresh_deploy() {
     require_python3
-    local domain port web_root confirm ts
+    load_state
+    local domain port web_root confirm ts reuse_self_port=0
     read -rp "请输入已解析到本机的域名 (例如 example.com): " domain
     domain=$(echo "$domain" | tr -d '\r\n' | xargs)
+    domain=${domain#https://}
+    domain=${domain#http://}
+    domain=${domain%%/*}
     if [[ -z "$domain" ]]; then
         err "域名不能为空。"
         return 1
@@ -592,6 +596,11 @@ fresh_deploy() {
             continue
         fi
         if is_port_in_use "$port"; then
+            if [[ "$port" == "$CUR_PORT" ]] && systemctl is-active --quiet "$XRAY_SVC" 2>/dev/null; then
+                info "端口 ${port} 当前正由本菜单管理的 ${XRAY_SVC} 占用，继续部署将停止旧实例并复用该端口。"
+                reuse_self_port=1
+                break
+            fi
             warn "端口 ${port} 已被本机其他进程占用，请换一个未占用的本地端口（例如 10086）。"
             continue
         fi
@@ -607,6 +616,10 @@ fresh_deploy() {
         ts=$(date +%Y%m%d%H%M%S)
         [[ -f "$XRAY_CONF" ]] && cp -a "$XRAY_CONF" "${XRAY_CONF}.bak.${ts}"
         [[ -f "$CADDY_CONF" ]] && cp -a "$CADDY_CONF" "${CADDY_CONF}.bak.${ts}"
+    fi
+
+    if [[ "$reuse_self_port" -eq 1 ]]; then
+        systemctl stop "$XRAY_SVC" 2>/dev/null || true
     fi
 
     info "1/5 检查并放行防火墙 80/443 端口..."
@@ -742,22 +755,189 @@ CADDY
     print_links
 }
 
+change_domain() {
+    require_python3
+    if [[ ! -f "$CADDY_CONF" ]]; then
+        err "未找到 Caddy 配置文件: $CADDY_CONF"
+        return 1
+    fi
+    load_state
+    echo -e "当前域名为: ${BOLD}${CUR_DOMAIN}${NC}"
+    local new_domain
+    read -rp "请输入新的域名 (请确认已解析到本机 IP): " new_domain
+    new_domain=$(echo "$new_domain" | tr -d '\r\n' | xargs)
+    new_domain=${new_domain#https://}
+    new_domain=${new_domain#http://}
+    new_domain=${new_domain%%/*}
+    new_domain=$(echo "$new_domain" | tr '[:upper:]' '[:lower:]')
+
+    if [[ -z "$new_domain" ]]; then
+        err "域名不能为空。"
+        return 1
+    fi
+    if ! [[ "$new_domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
+        err "域名格式不合法: ${new_domain}"
+        return 1
+    fi
+    if [[ "$new_domain" == "$CUR_DOMAIN" ]]; then
+        info "新域名与当前域名一致，无需修改。"
+        return 0
+    fi
+
+    cp -a "$CADDY_CONF" "${CADDY_CONF}.bak"
+    if python3 - "$CADDY_CONF" "$new_domain" <<'PY'
+import re, sys
+cconf, new_dom = sys.argv[1], sys.argv[2]
+with open(cconf, 'r', encoding='utf-8') as f:
+    lines = f.readlines()
+
+pat = re.compile(r'^(\s*)(?:https?://)?([A-Za-z0-9.-]+\.[A-Za-z]{2,})((?::\d+)?\s*\{.*)$')
+replaced = False
+for i, line in enumerate(lines):
+    s = line.strip()
+    if not s or s.startswith('#'):
+        continue
+    m = pat.match(line)
+    if m:
+        lines[i] = f"{m.group(1)}{new_dom}{m.group(3)}\n"
+        replaced = True
+        break
+
+if not replaced:
+    raise RuntimeError("未能在 Caddyfile 中定位到站点域名行")
+
+with open(cconf, 'w', encoding='utf-8') as f:
+    f.writelines(lines)
+PY
+    then
+        if caddy validate --config "$CADDY_CONF" >/dev/null 2>&1; then
+            systemctl reload caddy
+            info "域名已更换为 ${new_domain}，正在等待 Caddy 自动签发新证书 (约 6 秒)..."
+            sleep 6
+            echo ""
+            print_links
+        else
+            err "Caddyfile 校验失败，已自动回滚。"
+            mv -f "${CADDY_CONF}.bak" "$CADDY_CONF"
+        fi
+    else
+        err "更新 Caddyfile 失败，已自动回滚。"
+        mv -f "${CADDY_CONF}.bak" "$CADDY_CONF"
+    fi
+}
+
+extract_caddy_web_root() {
+    if [[ -f "$CADDY_CONF" ]] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$CADDY_CONF" <<'PY'
+import re, sys
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith('#'):
+                continue
+            m = re.match(r'^root\s+\*\s+(\S+)', s)
+            if m:
+                print(m.group(1))
+                sys.exit(0)
+except Exception:
+    pass
+PY
+    fi
+}
+
+uninstall_menu() {
+    load_state
+    echo ""
+    echo -e "${YELLOW}--- 卸载与释放端口 ---${NC}"
+    echo "1) 仅停止并禁用服务（立即释放 80/443/本地端口，保留配置文件）"
+    echo "2) 安全卸载本套 XHTTP + Caddy（保留原有 Xray 程序与 config.json）"
+    echo "3) 彻底卸载（含 Xray-core 本体，仅限无其他 Xray 节点时使用）"
+    echo "0) 返回主菜单"
+    local sub confirm_rm rm_caddy rm_menu web_root
+    read -rp "请选择 [0-3]: " sub
+    case "$sub" in
+        1)
+            systemctl disable --now "$XRAY_SVC" caddy 2>/dev/null || true
+            info "已停止并禁用 ${XRAY_SVC} 和 caddy。"
+            echo "--- 当前端口检查 ---"
+            if ss -tulpn | grep -E ":80 |:443 |:${CUR_PORT:-10000} "; then
+                warn "仍有部分端口处于监听状态，请检查上方进程。"
+            else
+                info "80 / 443 / ${CUR_PORT:-10000} 端口已全部释放。"
+            fi
+            ;;
+        2)
+            read -rp "确认停止服务并删除本套 XHTTP 配置 (${XRAY_CONF})? [y/N]: " confirm_rm
+            [[ ! "$confirm_rm" =~ ^[Yy]$ ]] && info "已取消。" && return 0
+            web_root=$(extract_caddy_web_root)
+            systemctl disable --now "$XRAY_SVC" caddy 2>/dev/null || true
+            rm -f "$XRAY_CONF" "${XRAY_CONF}.bak"*
+            info "已删除 ${XRAY_CONF}（未触碰原有 /usr/local/etc/xray/config.json）。"
+
+            read -rp "是否一并卸载 Caddy 软件包并删除 Caddy 配置及伪装网页目录? [y/N]: " rm_caddy
+            if [[ "$rm_caddy" =~ ^[Yy]$ ]]; then
+                DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq caddy || true
+                rm -rf /etc/caddy /var/lib/caddy
+                if [[ -n "$web_root" && "$web_root" != "/" && "$web_root" == /var/www/* ]]; then
+                    rm -rf "$web_root"
+                fi
+                info "已卸载 Caddy 并清理相关目录。"
+            fi
+
+            read -rp "是否一并删除管理脚本 (/usr/local/bin/xmenu 与 /usr/local/bin/xh)? [y/N]: " rm_menu
+            if [[ "$rm_menu" =~ ^[Yy]$ ]]; then
+                rm -f /usr/local/bin/xmenu /usr/local/bin/xh
+                info "已移除 xmenu 与 xh，卸载完成。"
+                exit 0
+            fi
+            info "安全卸载完成。"
+            ;;
+        3)
+            warn "警告：此操作会彻底删除 Xray-core 本体及 /usr/local/etc/xray 下所有配置（含 config.json）！"
+            read -rp "请输入大写 DELETE 确认彻底卸载: " confirm_rm
+            if [[ "$confirm_rm" != "DELETE" ]]; then
+                info "确认文字不匹配，已取消。"
+                return 0
+            fi
+            web_root=$(extract_caddy_web_root)
+            systemctl disable --now "$XRAY_SVC" xray caddy 2>/dev/null || true
+            bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge || true
+            rm -f /etc/systemd/system/xray@.service
+            rm -rf /usr/local/etc/xray
+            systemctl daemon-reload
+            DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq caddy || true
+            rm -rf /etc/caddy /var/lib/caddy
+            if [[ -n "$web_root" && "$web_root" != "/" && "$web_root" == /var/www/* ]]; then
+                rm -rf "$web_root"
+            fi
+            rm -f /usr/local/bin/xmenu /usr/local/bin/xh
+            info "已彻底卸载 Xray-core、Caddy 与管理脚本。"
+            exit 0
+            ;;
+        0|"") return 0 ;;
+        *) warn "无效选项。" ;;
+    esac
+}
+
 show_menu() {
     while true; do
         clear 2>/dev/null || true
         print_status_box
-        echo "  1. 查看节点配置与导入链接 (含直连 / CF 备用)"
-        echo "  2. 新增用户 (生成新 UUID + 可选备注)"
-        echo "  3. 删除用户"
-        echo "  4. 修改 XHTTP 隐蔽路径 (同步更新 Xray & Caddy)"
-        echo "  5. 服务管理 (重启 / 重载 / 停止 / 状态)"
-        echo "  6. 查看服务日志 (Xray / Caddy)"
-        echo "  7. 开启系统原生 BBR"
-        echo "  8. 更新 Xray-core 与 Caddy 到最新版"
-        echo "  9. 全新一键部署 (独立实例 xray@xhttp，不影响旧配置)"
-        echo "  0. 退出"
+        echo "   1. 查看节点配置与导入链接 (含直连 / CF 备用)"
+        echo "   2. 新增用户 (生成新 UUID + 可选备注)"
+        echo "   3. 删除用户"
+        echo "   4. 修改 XHTTP 隐蔽路径 (同步更新 Xray & Caddy)"
+        echo "   5. 服务管理 (重启 / 重载 / 停止 / 状态)"
+        echo "   6. 查看服务日志 (Xray / Caddy)"
+        echo "   7. 开启系统原生 BBR"
+        echo "   8. 更新 Xray-core 与 Caddy 到最新版"
+        echo "   9. 全新一键部署 (独立实例 xray@xhttp，不影响旧配置)"
+        echo "  10. 更换域名 (自动重新签发真实 TLS 证书)"
+        echo "  11. 卸载与释放端口 (停止释放 / 安全卸载 / 彻底卸载)"
+        echo "   0. 退出"
         echo -e "${CYAN}============================================================${NC}"
-        read -rp "请输入选项 [0-9]: " choice
+        read -rp "请输入选项 [0-11]: " choice
         case "$choice" in
             1) echo ""; print_links; pause_enter ;;
             2) echo ""; add_user; pause_enter ;;
@@ -768,8 +948,10 @@ show_menu() {
             7) echo ""; enable_bbr; pause_enter ;;
             8) echo ""; update_components; pause_enter ;;
             9) echo ""; fresh_deploy; pause_enter ;;
+            10) echo ""; change_domain; pause_enter ;;
+            11) uninstall_menu; pause_enter ;;
             0) echo "已退出。"; exit 0 ;;
-            *) warn "无效选项，请输入 0-9。"; sleep 1 ;;
+            *) warn "无效选项，请输入 0-11。"; sleep 1 ;;
         esac
     done
 }
